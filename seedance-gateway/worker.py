@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 
+from client_registry import SeedanceClientRegistry
 from dotenv import load_dotenv
 
 from provider_store import ProviderNotFoundError, ProviderStore
@@ -38,6 +39,7 @@ async def main() -> None:
     public_url = os.getenv("GATEWAY_PUBLIC_URL", "http://localhost:8001")
 
     client = SeedanceClient(keys, base_url)
+    client_registry = SeedanceClientRegistry()
     manager = TaskManager(
         redis_url,
         client,
@@ -60,20 +62,24 @@ async def main() -> None:
             logger.warning(f"Provider '{provider_slug}' is disabled, fallback to default")
             return client
 
-        return SeedanceClient(provider.api_keys, provider.base_url)
+        return await client_registry.get_or_create(provider.slug, provider.api_keys, provider.base_url)
 
     manager.client_resolver = resolve_client
 
     logger.info("Seedance worker started")
-    while True:
-        try:
-            await manager.run_worker(pop_timeout=pop_timeout)
-        except asyncio.CancelledError:
-            logger.info("Seedance worker cancelled")
-            raise
-        except Exception:
-            logger.exception("Worker loop failed; restarting after backoff")
-            await asyncio.sleep(restart_delay_seconds)
+    try:
+        while True:
+            try:
+                await manager.run_worker(pop_timeout=pop_timeout)
+            except asyncio.CancelledError:
+                logger.info("Seedance worker cancelled")
+                raise
+            except Exception:
+                logger.exception("Worker loop failed; restarting after backoff")
+                await asyncio.sleep(restart_delay_seconds)
+    finally:
+        await client_registry.aclose()
+        await client.aclose()
 
 
 if __name__ == "__main__":

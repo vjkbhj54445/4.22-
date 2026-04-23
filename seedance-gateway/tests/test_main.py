@@ -8,7 +8,8 @@ from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 
 import main
-from models import TaskStatus, TaskStatusResponse
+from client_registry import SeedanceClientRegistry
+from models import ProviderConfig, TaskStatus, TaskStatusResponse
 
 
 def build_expected_status_token(task_id: str, expires_at: int, secret: str = "secret-token") -> str:
@@ -519,6 +520,80 @@ async def test_readyz_returns_503_when_redis_is_unavailable(monkeypatch):
     assert response.json() == {"detail": "Redis unavailable"}
 
 
+class FakeProviderStore:
+    def __init__(self, providers: dict[str, ProviderConfig]):
+        self.providers = providers
+
+    async def get_provider(self, slug: str) -> ProviderConfig:
+        return self.providers[slug]
+
+
+@pytest.mark.asyncio
+async def test_resolve_provider_client_reuses_cached_client_for_same_provider(monkeypatch):
+    store = FakeProviderStore(
+        {
+            "main-account": ProviderConfig(
+                name="Main Account",
+                slug="main-account",
+                base_url="https://api.ppio.com",
+                api_keys=["key-a", "key-b"],
+                enabled=True,
+                created_at=1.0,
+                updated_at=1.0,
+            )
+        }
+    )
+    registry = SeedanceClientRegistry()
+
+    monkeypatch.setattr(main, "provider_store", store)
+    monkeypatch.setattr(main, "provider_client_registry", registry)
+
+    first_client, first_slug = await main.resolve_provider_client("main-account")
+    second_client, second_slug = await main.resolve_provider_client("main-account")
+
+    assert first_client is second_client
+    assert first_slug == "main-account"
+    assert second_slug == "main-account"
+    await registry.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resolve_provider_client_rebuilds_cached_client_when_provider_changes(monkeypatch):
+    store = FakeProviderStore(
+        {
+            "main-account": ProviderConfig(
+                name="Main Account",
+                slug="main-account",
+                base_url="https://api.ppio.com",
+                api_keys=["key-a"],
+                enabled=True,
+                created_at=1.0,
+                updated_at=1.0,
+            )
+        }
+    )
+    registry = SeedanceClientRegistry()
+
+    monkeypatch.setattr(main, "provider_store", store)
+    monkeypatch.setattr(main, "provider_client_registry", registry)
+
+    first_client, _ = await main.resolve_provider_client("main-account")
+    store.providers["main-account"] = ProviderConfig(
+        name="Main Account",
+        slug="main-account",
+        base_url="https://api2.ppio.com",
+        api_keys=["key-c"],
+        enabled=True,
+        created_at=1.0,
+        updated_at=2.0,
+    )
+
+    second_client, _ = await main.resolve_provider_client("main-account")
+
+    assert first_client is not second_client
+    await registry.aclose()
+
+
 @pytest.mark.asyncio
 async def test_admin_page_returns_management_ui():
     transport = ASGITransport(app=main.app)
@@ -584,6 +659,7 @@ async def test_admin_page_reads_template_independent_of_current_working_director
 @pytest.mark.asyncio
 async def test_provider_management_api_can_create_and_list_provider(monkeypatch):
     monkeypatch.setenv("GATEWAY_ACCESS_TOKEN", "secret-token")
+    monkeypatch.delenv("ADMIN_ACCESS_TOKEN", raising=False)
 
     transport = ASGITransport(app=main.app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -643,6 +719,7 @@ async def test_provider_management_api_supports_dedicated_admin_token(monkeypatc
 @pytest.mark.asyncio
 async def test_admin_routes_disable_caching(monkeypatch):
     monkeypatch.setenv("GATEWAY_ACCESS_TOKEN", "secret-token")
+    monkeypatch.delenv("ADMIN_ACCESS_TOKEN", raising=False)
 
     transport = ASGITransport(app=main.app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -661,6 +738,7 @@ async def test_admin_routes_disable_caching(monkeypatch):
 @pytest.mark.asyncio
 async def test_provider_management_api_can_update_set_default_and_delete_provider(monkeypatch):
     monkeypatch.setenv("GATEWAY_ACCESS_TOKEN", "secret-token")
+    monkeypatch.delenv("ADMIN_ACCESS_TOKEN", raising=False)
 
     transport = ASGITransport(app=main.app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -736,6 +814,7 @@ async def test_provider_management_api_can_update_set_default_and_delete_provide
 @pytest.mark.asyncio
 async def test_provider_management_api_can_get_and_update_existing_api_keys(monkeypatch):
     monkeypatch.setenv("GATEWAY_ACCESS_TOKEN", "secret-token")
+    monkeypatch.delenv("ADMIN_ACCESS_TOKEN", raising=False)
 
     transport = ASGITransport(app=main.app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:

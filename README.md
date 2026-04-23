@@ -62,6 +62,13 @@ docker compose logs -f gateway-api       # 查看 API 日志
 docker compose logs -f gateway-worker    # 查看 worker 日志
 docker compose down                      # 停止（保留数据）
 docker compose down -v                   # 停止并删除 redis 数据卷
+
+唯一标识（Slug）：main-account
+显示名称（Name）：主账号
+然后另外两个字段这样填：
+
+上游基础 URL：https://api.ppio.com
+请求密钥（API Keys）：填你真实的 PPIO key，一行一个
 ```
 
 ### 方式 B：本地开发（uvicorn + 本地 Redis）
@@ -110,8 +117,19 @@ python worker.py
 | `TASK_EXECUTION_MODE` | — | `queue` | `queue` 或 `inline` |
 | `MAX_CONCURRENT_TASKS` | — | `20` | Worker 最大并发任务数 |
 | `WORKER_RESTART_DELAY` | — | `3` | Worker 异常后重启延迟（秒） |
+| `SEEDANCE_SUBMIT_TIMEOUT` | — | `30` | 提交任务到 Seedance 的请求超时（秒） |
+| `SEEDANCE_POLL_TIMEOUT` | — | `10` | 查询任务状态的请求超时（秒） |
+| `SEEDANCE_HTTP_MAX_CONNECTIONS` | — | `100` | 单进程到 Seedance 的最大连接数 |
+| `SEEDANCE_HTTP_MAX_KEEPALIVE_CONNECTIONS` | — | `20` | 保持复用的空闲连接上限 |
+| `SEEDANCE_HTTP_KEEPALIVE_EXPIRY` | — | `30` | Keep-Alive 连接保留时长（秒） |
 
 > ⚠️ **安全提示**：不要把真实的 `.env` 提交到仓库。本仓库 `.gitignore` 已忽略 `**/.env`。
+
+### 性能优化说明
+
+- Seedance 上游 HTTP 客户端改为进程内连接池复用，避免每次提交任务和轮询任务都重新建立 TCP/TLS 连接。
+- 多 Provider 模式下，API 进程和 worker 都会按 Provider 配置缓存客户端；只有当 `base_url` 或 `api_keys` 发生变化时才重建连接池。
+- 部署时可通过上面的 `SEEDANCE_HTTP_*` 与超时参数按机器规格调优，无需改代码。
 
 ---
 

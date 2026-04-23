@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, Header, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from contextlib import asynccontextmanager
 
+from client_registry import SeedanceClientRegistry
 from models import (
     ProviderUpdateRequest,
     ChatMessage,
@@ -31,6 +32,7 @@ logger = logging.getLogger("seedance-gateway")
 seedance_client = None
 task_manager = None
 provider_store = None
+provider_client_registry = SeedanceClientRegistry()
 DEFAULT_GATEWAY_PUBLIC_URL = "http://localhost:8001"
 DEFAULT_TASK_STATUS_URL_TTL = 360
 FAST_MODEL_ALIASES = {"seedance-2.0-fast", "seedance-fast"}
@@ -218,6 +220,10 @@ async def get_provider_store() -> ProviderStore:
     return provider_store
 
 
+async def invalidate_provider_client(provider_slug: str) -> None:
+    await provider_client_registry.invalidate(provider_slug)
+
+
 async def resolve_provider_client(provider_slug: str | None) -> tuple[SeedanceClient, str | None]:
     if provider_slug:
         store = await get_provider_store()
@@ -229,7 +235,8 @@ async def resolve_provider_client(provider_slug: str | None) -> tuple[SeedanceCl
         if not provider.enabled:
             raise HTTPException(status_code=400, detail=f"Provider '{provider_slug}' is disabled")
 
-        return SeedanceClient(provider.api_keys, provider.base_url), provider.slug
+        client = await provider_client_registry.get_or_create(provider.slug, provider.api_keys, provider.base_url)
+        return client, provider.slug
 
     if seedance_client is None:
         raise HTTPException(status_code=503, detail="Gateway not initialized")
@@ -261,15 +268,19 @@ async def submit_seedance_task(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global seedance_client, task_manager, provider_store
+    global seedance_client, task_manager, provider_store, provider_client_registry
     # 初始化组件
     keys, base_url, redis_url, _ = load_runtime_config()
     seedance_client = SeedanceClient(keys, base_url)
     task_manager = TaskManager(redis_url, seedance_client)
     provider_store = ProviderStore(task_manager.redis, os.getenv("GATEWAY_PUBLIC_URL", DEFAULT_GATEWAY_PUBLIC_URL))
-    yield
-    # 清理
-    pass
+    provider_client_registry = SeedanceClientRegistry()
+    try:
+        yield
+    finally:
+        if seedance_client is not None:
+            await seedance_client.aclose()
+        await provider_client_registry.aclose()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -322,9 +333,9 @@ async def admin_page():
 
 @app.get("/admin/api/providers", dependencies=[Depends(verify_admin_token)])
 async def list_providers_api():
-        store = await get_provider_store()
-        providers = await store.list_providers()
-        return providers.model_dump()
+    store = await get_provider_store()
+    providers = await store.list_providers()
+    return providers.model_dump()
 
 
 @app.get("/admin/api/providers/{provider_slug}", dependencies=[Depends(verify_admin_token)])
@@ -339,42 +350,45 @@ async def get_provider_detail_api(provider_slug: str):
 
 @app.post("/admin/api/providers", status_code=201, dependencies=[Depends(verify_admin_token)])
 async def create_provider_api(request: ProviderCreateRequest):
-        store = await get_provider_store()
-        try:
-                provider_summary = await store.create_provider(request)
-        except ProviderAlreadyExistsError as exc:
-                raise HTTPException(status_code=409, detail=f"Provider '{request.slug}' already exists") from exc
+    store = await get_provider_store()
+    try:
+        provider_summary = await store.create_provider(request)
+    except ProviderAlreadyExistsError as exc:
+        raise HTTPException(status_code=409, detail=f"Provider '{request.slug}' already exists") from exc
 
-        return provider_summary.model_dump()
+    await invalidate_provider_client(request.slug)
+    return provider_summary.model_dump()
 
 
 @app.post("/admin/api/providers/{provider_slug}/set-default", dependencies=[Depends(verify_admin_token)])
 async def set_default_provider_api(provider_slug: str):
-        store = await get_provider_store()
-        try:
-                summary = await store.set_default_provider(provider_slug)
-        except ProviderNotFoundError as exc:
-                raise HTTPException(status_code=404, detail=f"Provider '{provider_slug}' not found") from exc
-        return summary.model_dump()
+    store = await get_provider_store()
+    try:
+        summary = await store.set_default_provider(provider_slug)
+    except ProviderNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Provider '{provider_slug}' not found") from exc
+    return summary.model_dump()
 
 @app.put("/admin/api/providers/{provider_slug}", dependencies=[Depends(verify_admin_token)])
 async def update_provider_api(provider_slug: str, request: ProviderUpdateRequest):
-        store = await get_provider_store()
-        try:
-                summary = await store.update_provider(provider_slug, request)
-        except ProviderNotFoundError as exc:
-                raise HTTPException(status_code=404, detail=f"Provider '{provider_slug}' not found") from exc
-        return summary.model_dump()
+    store = await get_provider_store()
+    try:
+        summary = await store.update_provider(provider_slug, request)
+    except ProviderNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Provider '{provider_slug}' not found") from exc
+    await invalidate_provider_client(provider_slug)
+    return summary.model_dump()
 
 
 @app.delete("/admin/api/providers/{provider_slug}", dependencies=[Depends(verify_admin_token)])
 async def delete_provider_api(provider_slug: str):
-        store = await get_provider_store()
-        try:
-                await store.delete_provider(provider_slug)
-        except ProviderNotFoundError as exc:
-                raise HTTPException(status_code=404, detail=f"Provider '{provider_slug}' not found") from exc
-        return {"detail": "Provider deleted successfully"}
+    store = await get_provider_store()
+    try:
+        await store.delete_provider(provider_slug)
+    except ProviderNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Provider '{provider_slug}' not found") from exc
+    await invalidate_provider_client(provider_slug)
+    return {"detail": "Provider deleted successfully"}
 
 
 # ================= 路由：OpenAI 兼容接口 =================

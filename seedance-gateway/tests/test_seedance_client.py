@@ -125,6 +125,30 @@ async def test_submit_task_does_not_permanently_blacklist_rate_limited_key():
 
 
 @pytest.mark.asyncio
+async def test_submit_task_reuses_persistent_http_client():
+    seen_clients: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_clients.append(request.headers["Authorization"])
+        return httpx.Response(200, json={"task_id": "upstream-task-pooled"})
+
+    client = SeedanceClient(
+        ["key-a"],
+        "https://seedance.example",
+        transport=httpx.MockTransport(handler),
+    )
+
+    await client.submit_task(SeedanceTaskRequest(prompt="first request", fast=True))
+    first_http_client = await client._get_client()
+    await client.submit_task(SeedanceTaskRequest(prompt="second request", fast=True))
+    second_http_client = await client._get_client()
+
+    assert first_http_client is second_http_client
+    assert seen_clients == ["Bearer key-a", "Bearer key-a"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_submit_task_permanently_skips_unauthorized_key():
     seen_tokens: list[str] = []
 
